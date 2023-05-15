@@ -1,0 +1,668 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description:
+  "Creates resources necessary to demonstrate replication from Amazon Aurora PostgreSQL to
+  Amazon MemoryDB for Redis using AWS Database Migration Service"
+Parameters:
+  DoesDMSVPCRoleExist:
+    Default: N
+    Type: String
+    Description: If the IAM role dms-vpc-role already exists, choose Y
+    AllowedValues:
+      - Y
+      - N
+    ConstraintDescription: Permitted values are is Y or N
+  VPCCIDR:
+    Type: String
+    Description: VPC CIDR
+    Default: "10.0.0.0/26"
+  PrivateSubnetOneCIDR:
+    Type: String
+    Description: Subnet One CIDR
+    Default: "10.0.0.0/28"
+  PrivateSubnetTwoCIDR:
+    Type: String
+    Description: Subnet One CIDR
+    Default: "10.0.0.16/28"
+  PublicSubnetOneCIDR:
+    Type: String
+    Description: Public Subnet One CIDR
+    Default: "10.0.0.32/28"
+  MemoryDBRedisNodeType:
+    Description: "The compute and memory capacity of the nodes in the node group"
+    Type: String
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.small
+      - db.t4g.medium
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+      - db.r6g.8xlarge
+      - db.r6g.12xlarge
+      - db.r6g.16xlarge
+  DBInstanceClass:
+    Description: RDS Instance Class
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r5.8xlarge
+      - db.t3.medium
+      - db.t3.large
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - r5.large
+      - r5.xlarge
+      - r5.2xlarge
+      - r5.4xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  AutoHibernateTimeout:
+    Description:  How many minutes idle before shutting down the IDE. Options, 30 minutes, 1 hour, 4 hours, 1day, 1week, Never (0)
+    Type:         Number
+    Default:      60
+    AllowedValues:
+      - 30
+      - 60
+      - 240
+      - 1440
+      - 10080
+      - 0
+
+Conditions:
+  NotExistsDMSVPCRole: !Equals
+    - !Ref DoesDMSVPCRoleExist
+    - N
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AZ1: use1-az2
+      AZ2: use1-az4
+    us-east-2:
+      AZ1: use2-az1
+      AZ2: use2-az2
+    us-west-1:
+      AZ1: usw1-az1
+      AZ2: usw1-az3
+    us-west-2:
+      AZ1: usw2-az1
+      AZ2: usw2-az2
+    ca-central-1:
+      AZ1: cac1-az1
+      AZ2: cac1-az2
+    ap-east-1:
+      AZ1: ape1-az1
+      AZ2: ape1-az2
+    ap-south-1:
+      AZ1: aps1-az1
+      AZ2: aps1-az2
+    ap-northeast-1:
+      AZ1: apne1-az1
+      AZ2: apne1-az2
+    ap-northeast-2:
+      AZ1: apne2-az1
+      AZ2: apne2-az2
+    ap-southeast-1:
+      AZ1: apse1-az1
+      AZ2: apse1-az2
+    ap-southeast-2:
+      AZ1: apse2-az1
+      AZ2: apse2-az2
+    eu-central-1:
+      AZ1: euc1-az1
+      AZ2: euc1-az2
+    eu-west-1:
+      AZ1: euw1-az1
+      AZ2: euw1-az2
+    eu-west-2:
+      AZ1: euw2-az1
+      AZ2: euw2-az2
+    eu-north-1:
+      AZ1: eun1-az1
+      AZ2: eun1-az2
+    sa-east-1:
+      AZ1: sae1-az1
+      AZ2: sae1-az2
+    cn-north-1:
+      AZ1: cnn1-az1
+      AZ2: cnn1-az2
+    cn-northwest-1:
+      AZ1: cnw1-az1
+      AZ2: cnw1-az2
+
+Resources:
+  # B A S T I O N   H O S T   -----------------------------------------------------------------------------------------
+  Cloud9IDE:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      AutomaticStopTimeMinutes: !Ref AutoHibernateTimeout
+      Description: "Cloud9 IDE to interact with Aurora PostgreSQL and Amazon MemoryDB for Redis "
+      InstanceType: !Ref InstanceType
+      ImageId: amazonlinux-2-x86_64
+      Name: PostgreSQLInstance
+      SubnetId: !Ref PublicSubnetOne
+
+  VPCFlowLogsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service: "vpc-flow-logs.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "vpc-flow-logs-rds"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                Resource: !GetAtt VPCFlowLogsGroupRDS.Arn
+
+  FlowLogsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for encrypting flow logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: keyForFlowLogs
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+          - Sid: Allow log encryption
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:VPCFlowLogsRDS
+
+  # N E T W O R K I N G   ---------------------------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !Ref VPCCIDR
+      Tags:
+        - Key: Name
+          Value: "Aurora-PostgreSQL-MemoryDB-VPC"
+
+  VPCFlowLogsGroupRDS:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: "VPCFlowLogsRDS"
+      KmsKeyId: !GetAtt FlowLogsKey.Arn
+      RetentionInDays: 7
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      LogGroupName: "VPCFlowLogsRDS"
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZoneId: !FindInMap [RegionMap, !Ref "AWS::Region", AZ1]
+      VpcId: !Ref "VPC"
+      CidrBlock: !Ref PrivateSubnetOneCIDR
+      Tags:
+        - Key: Name
+          Value: "Private Subnet One"
+
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZoneId: !FindInMap [RegionMap, !Ref "AWS::Region", AZ2]
+      VpcId: !Ref "VPC"
+      CidrBlock: !Ref PrivateSubnetTwoCIDR
+      Tags:
+        - Key: Name
+          Value: "Private Subnet Two"
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref "VPC"
+      CidrBlock: !Ref PublicSubnetOneCIDR
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: "Public Subnet One"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - Ref: AWS::StackName
+                - InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref "VPC"
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref "VPC"
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - Ref: AWS::StackName
+                - PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: "RDS Route Table"
+
+  PrivateSubnetOneRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateSubnetOne
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PrivateSubnetTwo
+      RouteTableId: !Ref PrivateRouteTable
+
+  # R D B M S   A U R O R A   P O S T G R E S Q L   -------------------------------------------------------------------
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private SG For internal communication
+      VpcId: !Ref "VPC"
+
+  RDSSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow EC2 Instance to connect
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: "tcp"
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Ref VPCCIDR  
+
+  RDSSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: To communicate within the SG
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: "tcp"
+      FromPort: 0
+      ToPort: 0
+      DestinationSecurityGroupId: !GetAtt RDSSecurityGroup.GroupId
+
+  DMSSecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for Secrets Manager
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: keyForSecrets
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+
+  DMSSecret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Name: /dmsdemo/dbsecret
+      Description: Generates random value for db password and stores in secrets manager
+      KmsKeyId: !Ref DMSSecretsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "dbadmin", "port": "5432", "host": " "}'
+        GenerateStringKey: "password"
+        PasswordLength: 20
+        ExcludeCharacters: "\"@/\\;.:+' %"
+
+  RDSCluster:
+    Type: "AWS::RDS::DBCluster"
+    Properties:
+      DBClusterIdentifier: dmsdemo-aurora-cluster-aws
+      DBClusterParameterGroupName: !Ref RDSDBClusterParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora-postgresql
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DMSSecret}::password}}"
+      MasterUsername: dbadmin
+      DatabaseName: "dmssource"
+      Port: 5432
+      StorageEncrypted: true
+      VpcSecurityGroupIds: [!Ref RDSSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: dmsdemo-cluster-aws
+
+  RDSDBClusterParameterGroup:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    Properties:
+      Description: "Aurora Cluster Parameter Group"
+      Family: aurora-postgresql14
+      Parameters:
+        rds.logical_replication: 1
+        wal_sender_timeout: 0
+
+  RDSDBInstance1:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AvailabilityZone: !GetAtt PrivateSubnetOne.AvailabilityZone
+      DBClusterIdentifier: !Ref RDSCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref RDSDBParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  RDSDBParameterGroup:
+    Type: "AWS::RDS::DBParameterGroup"
+    Properties:
+      Description: Aurora Parameter Group
+      Family: aurora-postgresql14
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: String
+      DBSubnetGroupName: source-db-subnet-group-aws
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+
+  SMRDSAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DMSSecret
+      TargetId: !Ref RDSDBInstance1
+      TargetType: AWS::RDS::DBInstance
+
+  # M E M O R Y D B   F O R   R E D I S   -----------------------------------------------------------------------------
+  MemoryDBRedisSecret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Name: /dmsdemo/memorydbredissecret
+      Description: Generates random value for db password and stores in secrets manager
+      KmsKeyId: !Ref DMSSecretsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "memorydbdmsuser", "port": "6379"}'
+        GenerateStringKey: "password"
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  MemoryDBRedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MemoryDB Redis Security Group
+      VpcId: !Ref "VPC"
+
+  MemoryDBRedisSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow EC2 Instance to connect to Redis
+      GroupId: !Ref MemoryDBRedisSecurityGroup
+      IpProtocol: "tcp"
+      FromPort: 6379
+      ToPort: 6379
+      CidrIp: !Ref VPCCIDR  
+
+  MemoryDBRedisSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: To communicate within the SG
+      GroupId: !Ref MemoryDBRedisSecurityGroup
+      IpProtocol: "tcp"
+      FromPort: 0
+      ToPort: 0
+      DestinationSecurityGroupId: !GetAtt MemoryDBRedisSecurityGroup.GroupId
+
+  MemoryDBSubnetGroup:
+    Type: AWS::MemoryDB::SubnetGroup
+    Properties:
+      Description: MemoryDB for Redis Subnet Group
+      SubnetGroupName: "memory-db-redis-subnet-group"
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+
+  MemoryDBRedisUser:
+    Type: AWS::MemoryDB::User
+    Properties:
+      AccessString: "on ~* &* +@all"
+      AuthenticationMode:
+        Type: "password"
+        Passwords:
+          - !Sub "{{resolve:secretsmanager:${MemoryDBRedisSecret}::password}}"
+      UserName: "memorydbdmsuser"
+
+  MemoryDBRedisACL:
+    Type: AWS::MemoryDB::ACL
+    DependsOn: MemoryDBRedisUser
+    Properties:
+      ACLName: "memorydbdmsacl"
+      UserNames:
+        - "memorydbdmsuser"
+
+  MemoryDBRedisCluster:
+    Type: AWS::MemoryDB::Cluster
+    DependsOn: MemoryDBRedisACL
+    Properties:
+      ACLName: "memorydbdmsacl"
+      ClusterName: "memorydbdmscluster"
+      Description: "Memory DB for Redis Cluster"
+      NodeType: !Ref MemoryDBRedisNodeType
+      NumReplicasPerShard: 1
+      NumShards: 3
+      Port: 6379
+      SecurityGroupIds: [!Ref MemoryDBRedisSecurityGroup]
+      SubnetGroupName: !Ref MemoryDBSubnetGroup
+      TLSEnabled: true
+      Tags:
+        - Key: Name
+          Value: "MemoryDBRedisCluster"
+
+  # D A T A B A S E   M I G R A T I O N   S E R V I C E   -------------------------------------------------------------
+  DMSVPCRole:
+    Type: "AWS::IAM::Role"
+    Condition: NotExistsDMSVPCRole
+    Properties:
+      RoleName: "dms-vpc-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Principal:
+              Service: "dms.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole"
+
+  DMSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis Security Group
+      VpcId: !Ref "VPC"
+
+  DMSSecurityGroupEgress1:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: To communicate with Redis
+      GroupId: !Ref DMSSecurityGroup
+      IpProtocol: "tcp"
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !GetAtt MemoryDBRedisSecurityGroup.GroupId
+
+  DMSSecurityGroupEgress2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: To communicate with RDS
+      GroupId: !Ref DMSSecurityGroup
+      IpProtocol: "tcp"
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !GetAtt RDSSecurityGroup.GroupId
+
+  DMSSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupDescription: "DMS Subnet Group"
+      ReplicationSubnetGroupIdentifier: "dms-subnet-group"
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+      Tags:
+        - Key: Name
+          Value: "DMS Subnet Group"
+
+  DMSReplicationInstance:
+    Type: "AWS::DMS::ReplicationInstance"
+    Properties:
+      ReplicationInstanceClass: dms.t3.medium
+      PubliclyAccessible: false
+      EngineVersion: "3.4.7"
+      ReplicationInstanceIdentifier: "postgresql-memorydb-dms-instance"
+      ReplicationSubnetGroupIdentifier: !Ref DMSSubnetGroup
+      VpcSecurityGroupIds: [!Ref DMSSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: "DMS Replication Instance"
+
+  DMSSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: "postgresql-source-endpoint"
+      EndpointType: "source"
+      EngineName: "aurora-postgresql"
+      Password: !Sub "{{resolve:secretsmanager:${DMSSecret}::password}}"
+      Port: 5432
+      ServerName: !GetAtt RDSDBInstance1.Endpoint.Address
+      Username: dbadmin
+      DatabaseName: "dmssource"
+
+  DMSTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    DependsOn: MemoryDBRedisCluster
+    Properties:
+      EndpointIdentifier: "memorydb-target-endpoint"
+      EndpointType: "target"
+      EngineName: "redis"
+      SslMode: "none"
+      RedisSettings:
+        ServerName: !GetAtt MemoryDBRedisCluster.ClusterEndpoint.Address
+        Port: 6379
+        AuthType: "auth-role"
+        AuthUserName: "memorydbdmsuser"
+        AuthPassword: !Sub "{{resolve:secretsmanager:${MemoryDBRedisSecret}::password}}"
+        SslSecurityProtocol: "ssl-encryption"
+
+  DMSReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      MigrationType: "full-load"
+      ReplicationInstanceArn: !Ref DMSReplicationInstance
+      ReplicationTaskIdentifier: "replicate-products"
+      ResourceIdentifier: String
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TableMappings: '{
+        "rules": [
+        {
+        "rule-type": "selection",
+        "rule-id": "1",
+        "rule-name": "1",
+        "object-locator": {
+        "schema-name": "public",
+        "table-name": "%"
+        },
+        "rule-action": "include",
+        "filters": []
+        }
+        ]
+        }'
+      TargetEndpointArn: !Ref DMSTargetEndpoint
+
+Outputs:
+  RDSEndpoint:
+    Description: RDS Endpoint Amazon Aurora PostgreSQL
+    Value: !GetAtt RDSCluster.Endpoint.Address
+  MemoryDBRedisClusterEndpoint:
+    Description: MemoryDB for Redis Cluster Endpoint
+    Value: !GetAtt MemoryDBRedisCluster.ClusterEndpoint.Address
+  DMSSourceEndpointArn:
+    Description: Endpoint ARN of the DMS Source Endpoint
+    Value: !Ref DMSSourceEndpoint
+  DMSTargetEndpointArn:
+      Description: Endpoint ARN of the DMS Target Endpoint
+      Value: !Ref DMSTargetEndpoint
+  DMSReplicationInstanceArn:
+    Description: ARN of the DMS Replication Instance
+    Value: !Ref DMSReplicationInstance
+  SecretArn:
+    Description: Secret Key ARN
+    Value: !Ref DMSSecret
