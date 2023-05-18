@@ -31,5 +31,5 @@ echo "export MEMDB=\`aws secretsmanager get-secret-value  --secret-id \"/dmsdemo
 echo "export MEMDBHOST=\`aws cloudformation describe-stacks --region us-east-1 --query \"Stacks[?StackName=='DMSPostgreSQLMemoryDB'][].Outputs[?OutputKey=='MemoryDBRedisClusterEndpoint'].OutputValue\" --output text\`" >> ~/.bashrc
 echo "export MEMDBPASSWORD=\`aws secretsmanager get-secret-value  --secret-id \"/dmsdemo/memorydbredissecret\" --region $REGION --query 'SecretString' --output text | jq -r '.\"password\"'\`" >> ~/.bashrc
 
-echo "export PATH=\"$PATH:/usr/local/pgsql/bin:/home/ec2-user/environment/dms-posgresql-memorydb/scripts/redis-stable/src/\"" >> ~/.bashrc
+echo "export PATH=\"$PATH:/usr/local/pgsql/bin:/home/ec2-user/environment/aws-dms-postgresql-to-memorydb-migration/scripts/redis-stable/src/\"" >> ~/.bashrc
 
